@@ -26,7 +26,7 @@ import threading
 import subprocess
 import queue
 from tkinter import (
-    Tk, StringVar, IntVar, BooleanVar, ttk, filedialog, messagebox, BOTH, END, N, S, E, W
+    Tk, Toplevel, StringVar, IntVar, BooleanVar, ttk, filedialog, messagebox, BOTH, END, N, S, E, W
 )
 from tkinter.scrolledtext import ScrolledText
 import re
@@ -289,7 +289,7 @@ class MX01WGUI:
         result = {"ans": "y"}
 
         def show_dialog():
-            win = ttk.Toplevel(self.root)
+            win = Toplevel(self.root)
             win.title("Confirm print"); win.transient(self.root); win.grab_set()
             ttk.Label(win, text=f"Print this job?\n{desc}").grid(row=0, column=0, columnspan=4, padx=12, pady=(12,8))
             def choose(ch):
@@ -314,33 +314,41 @@ class MX01WGUI:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                stdin=subprocess.PIPE,   # << allow replying to the CLI
+                stdin=subprocess.PIPE,
                 text=True,
-                bufsize=1
+                bufsize=0  # fully unbuffered so read(1) returns promptly
             )
 
-            # detect the CLI interactive preview prompt
             prompt_re = re.compile(
-                r"^\[(\d+)/(\d+)\] Print '(.+?)'\? \[Y\]es / \[s\]kip / \[a\]ll remaining / \[q\]uit:"
+                r"\[(\d+)/(\d+)\]\s+Print '(.+?)'\?\s+\[Y\]es\s*/\s*\[s\]kip\s*/\s*\[a\]ll remaining\s*/\s*\[q\]uit:",
+                re.DOTALL
             )
 
-            for raw in self.proc.stdout:
-                line = raw.rstrip("\n")
+            buf = ""
+            while True:
+                ch = self.proc.stdout.read(1)
+                if not ch:  # EOF
+                    break
 
-                # If the CLI prints its question without a trailing newline, we still
-                # want to catch it. The -u flag above helps ensure we get it promptly.
-                m = prompt_re.search(line)
+                buf += ch
+                # forward to UI immediately (character streaming = snappy log)
+                self.output_q.put(ch)
+
+                # Only keep a reasonable tail to search (performance & memory)
+                if len(buf) > 4000:
+                    buf = buf[-2000:]
+
+                m = prompt_re.search(buf)
                 if m and self.proc and self.proc.stdin:
                     desc = m.group(3)
-                    ans = self._ask_preview_choice_blocking(desc)   # 'y'/'s'/'a'/'q'
+                    ans = self._ask_preview_choice_blocking(desc)  # 'y'/'s'/'a'/'q'
                     try:
                         self.proc.stdin.write(ans + "\n")
                         self.proc.stdin.flush()
                     except Exception as e:
                         self.output_q.put(f"\n[Error sending response to CLI] {e}\n")
-
-                # forward output to the log
-                self.output_q.put(raw)
+                    # drop everything up to the end of the matched prompt
+                    buf = buf[m.end():]
 
             self.proc.wait()
             rc = self.proc.returncode
