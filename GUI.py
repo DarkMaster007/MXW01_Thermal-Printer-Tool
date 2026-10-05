@@ -1,62 +1,72 @@
 """
-MX01W GUI Launcher (Tkinter)
-----------------------------
-A lightweight GUI that shells out to your existing CLI script (this keeps all your
-Bleak/PIL logic untouched). No extra deps beyond Tkinter.
+MXW01 Thermal Printer GUI
+-------------------------
+Simple Tkinter front-end for MXW01printV3_clean.py.
 
-How it works:
-- Builds the appropriate command line based on UI selections
-- Runs your script in a background thread (subprocess) and streams logs to the UI
-- Supports printing image/folder/text, test print, and paper feed
-- Lets you pick dither mode, threshold, overstrike, font, alignment, upside-down, debug-save
-- Specify device by name (preferred) or MAC address
+What it supports:
+- Print single image
+- Print folder of images
+- Print text
+- Feed paper
+- Debug-save prepared bitmaps instead of printing
+- Select device by MAC or by BLE name
+- Dither / threshold / overstrike / font / alignment / upside-down
+- List fonts from the CLI
 
-Usage:
-  1) Put this file next to your current CLI script, e.g. `catprint_cli.py`.
-  2) Update CLI_SCRIPT_NAME below if your filename is different.
-  3) Run:  python mx01w_gui.py
-
-If you later refactor your CLI to expose a function instead of exiting with sys.exit,
-we can switch from subprocess to direct function calls easily.
+Run:
+    python MXW01_GUI_clean.py
 """
 
-import sys
 import os
-import threading
-import subprocess
 import queue
-from tkinter import (
-    Tk, Toplevel, StringVar, IntVar, BooleanVar, ttk, filedialog, messagebox, BOTH, END, N, S, E, W
-)
+import subprocess
+import sys
+import threading
+from tkinter import BOTH, END, E, N, NE, S, W, BooleanVar, IntVar, StringVar, Text, Tk, filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-import re
 
-# === Configure the CLI script name here ===
-CLI_SCRIPT_NAME = "MXW01printV2.py"  # change if your file is named differently
 
+CLI_SCRIPT_NAME = "MXW01printV3.py"
+
+# Try to get available fonts via matplotlib (used by the CLI)
+_AVAILABLE_FONTS = []
+try:
+    from matplotlib import font_manager as _fm
+    _AVAILABLE_FONTS = sorted(set(f.name for f in _fm.fontManager.ttflist))
+except ImportError:
+    pass
 DITHER_CHOICES = [
-    "none","fs","atkinson","jarvis","stucki","burkes",
-    "sierra","sierra2","sierra-lite","bayer4","bayer8"
+    "none", "fs", "atkinson", "jarvis", "stucki", "burkes",
+    "sierra", "sierra2", "sierra-lite", "bayer4", "bayer8", "dense"
 ]
 ALIGN_CHOICES = ["left", "center", "right"]
+MODE_CHOICES = [
+    ("Image", "image"),
+    ("Folder", "folder"),
+    ("Text", "text"),
+    ("Test print", "test"),
+    ("Feed paper", "feed"),
+]
 
-class MX01WGUI:
+TEST_IMAGE_FOLDER = "test_print_images"
+
+
+class MXW01GUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("MX01W Thermal Printer - GUI")
+        self.root.title("MXW01 Thermal Printer")
         self.proc = None
         self.output_q = queue.Queue()
         self.is_running = False
+        self.after_id = None
 
-        # ====== State ======
         self.device_name = StringVar()
         self.device_addr = StringVar()
-        self.mode = StringVar(value="image")  # image|folder|text|test|feed
+        self.mode = StringVar(value="image")
         self.image_path = StringVar()
         self.folder_path = StringVar()
-        self.text_to_print = StringVar()
         self.feed_lines = IntVar(value=40)
-        self.font_name = StringVar(value="Arial")
+        self.font_name = StringVar(value=_AVAILABLE_FONTS[0] if _AVAILABLE_FONTS else "")
         self.font_size = IntVar(value=24)
         self.align = StringVar(value="left")
         self.dither = StringVar(value="fs")
@@ -64,249 +74,238 @@ class MX01WGUI:
         self.overstrike = IntVar(value=1)
         self.upside_down = BooleanVar(value=False)
         self.debug_save = BooleanVar(value=False)
+        self.brightness = IntVar(value=128)
+        self.intensity = IntVar(value=93)
 
-        # ====== Layout ======
-        main = ttk.Frame(root, padding=10)
-        main.grid(row=0, column=0, sticky=N+S+E+W)
-        root.columnconfigure(0, weight=1)
-        root.rowconfigure(0, weight=1)
+        self._build_ui()
+        self._on_mode_change()
+        self.after_id = self.root.after(50, self._pump_output)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Device frame
-        devf = ttk.LabelFrame(main, text="Device")
-        devf.grid(row=0, column=0, columnspan=2, sticky=E+W, pady=(0,8))
-        devf.columnconfigure(1, weight=1)
-        devf.columnconfigure(3, weight=1)
-        ttk.Label(devf, text="Name (preferred):").grid(row=0, column=0, sticky=E, padx=4, pady=4)
-        ttk.Entry(devf, textvariable=self.device_name).grid(row=0, column=1, sticky=E+W, padx=4, pady=4)
-        ttk.Label(devf, text="MAC addr:").grid(row=0, column=2, sticky=E, padx=4, pady=4)
-        ttk.Entry(devf, textvariable=self.device_addr).grid(row=0, column=3, sticky=E+W, padx=4, pady=4)
+    def _build_ui(self):
+        main = ttk.Frame(self.root, padding=10)
+        main.grid(row=0, column=0, sticky=N + S + E + W)
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
 
-        # Mode frame
-        modef = ttk.LabelFrame(main, text="Mode")
-        modef.grid(row=1, column=0, sticky=N+S+E+W, pady=(0,8))
-        for i in range(2):
-            modef.columnconfigure(i, weight=1)
-        # radio buttons
-        modes = [
-            ("Image", "image"),
-            ("Folder", "folder"),
-            ("Text", "text"),
-            ("Test print", "test"),
-            ("Feed paper", "feed"),
-        ]
-        for r, (label, val) in enumerate(modes):
-            ttk.Radiobutton(modef, text=label, value=val, variable=self.mode, command=self._on_mode_change).grid(row=r, column=0, sticky=W, padx=4, pady=2)
+        device_frame = ttk.LabelFrame(main, text="Device")
+        device_frame.grid(row=0, column=0, columnspan=2, sticky=E + W, pady=(0, 8))
+        device_frame.columnconfigure(1, weight=1)
+        device_frame.columnconfigure(3, weight=1)
 
-        # Content frame
-        contf = ttk.LabelFrame(main, text="Content")
-        contf.grid(row=1, column=1, sticky=N+S+E+W, pady=(0,8))
-        contf.columnconfigure(1, weight=1)
+        ttk.Label(device_frame, text="Name:").grid(row=0, column=0, sticky=E, padx=4, pady=4)
+        ttk.Entry(device_frame, textvariable=self.device_name).grid(row=0, column=1, sticky=E + W, padx=4, pady=4)
+        ttk.Label(device_frame, text="MAC:").grid(row=0, column=2, sticky=E, padx=4, pady=4)
+        ttk.Entry(device_frame, textvariable=self.device_addr).grid(row=0, column=3, sticky=E + W, padx=4, pady=4)
 
-        # image / folder selectors
-        self.btn_img = ttk.Button(contf, text="Select Image…", command=self._pick_image)
-        self.ent_img = ttk.Entry(contf, textvariable=self.image_path)
-        self.btn_dir = ttk.Button(contf, text="Select Folder…", command=self._pick_folder)
-        self.ent_dir = ttk.Entry(contf, textvariable=self.folder_path)
+        mode_frame = ttk.LabelFrame(main, text="Mode")
+        mode_frame.grid(row=1, column=0, sticky=N + S + E + W, pady=(0, 8))
+        mode_frame.columnconfigure(0, weight=1)
 
-        # text entry
-        ttk.Label(contf, text="Text:").grid(row=2, column=0, sticky=E, padx=4, pady=4)
-        self.ent_text = ttk.Entry(contf, textvariable=self.text_to_print)
-        self.ent_text.grid(row=2, column=1, sticky=E+W, padx=4, pady=4)
+        for row, (label, value) in enumerate(MODE_CHOICES):
+            ttk.Radiobutton(mode_frame, text=label, value=value, variable=self.mode, command=self._on_mode_change).grid(
+                row=row, column=0, sticky=W, padx=4, pady=2
+            )
 
-        # feed
-        ttk.Label(contf, text="Feed lines:").grid(row=3, column=0, sticky=E, padx=4, pady=4)
-        self.spn_feed = ttk.Spinbox(contf, from_=1, to=500, increment=1, textvariable=self.feed_lines, width=8)
-        self.spn_feed.grid(row=3, column=1, sticky=W, padx=4, pady=4)
+        content_frame = ttk.LabelFrame(main, text="Content")
+        content_frame.grid(row=1, column=1, sticky=N + S + E + W, pady=(0, 8))
+        content_frame.columnconfigure(1, weight=1)
 
-        # place img/folder rows
-        ttk.Label(contf, text="Image:").grid(row=0, column=0, sticky=E, padx=4, pady=4)
-        self.ent_img.grid(row=0, column=1, sticky=E+W, padx=4, pady=4)
+        ttk.Label(content_frame, text="Image:").grid(row=0, column=0, sticky=E, padx=4, pady=4)
+        self.ent_img = ttk.Entry(content_frame, textvariable=self.image_path)
+        self.ent_img.grid(row=0, column=1, sticky=E + W, padx=4, pady=4)
+        self.btn_img = ttk.Button(content_frame, text="Browse...", command=self._pick_image)
         self.btn_img.grid(row=0, column=2, sticky=W, padx=4, pady=4)
-        ttk.Label(contf, text="Folder:").grid(row=1, column=0, sticky=E, padx=4, pady=4)
-        self.ent_dir.grid(row=1, column=1, sticky=E+W, padx=4, pady=4)
+
+        ttk.Label(content_frame, text="Folder:").grid(row=1, column=0, sticky=E, padx=4, pady=4)
+        self.ent_dir = ttk.Entry(content_frame, textvariable=self.folder_path)
+        self.ent_dir.grid(row=1, column=1, sticky=E + W, padx=4, pady=4)
+        self.btn_dir = ttk.Button(content_frame, text="Browse...", command=self._pick_folder)
         self.btn_dir.grid(row=1, column=2, sticky=W, padx=4, pady=4)
 
-        # Options frame
-        optf = ttk.LabelFrame(main, text="Options")
-        optf.grid(row=2, column=0, columnspan=2, sticky=E+W, pady=(0,8))
-        for c in range(8):
-            optf.columnconfigure(c, weight=1)
+        ttk.Label(content_frame, text="Text:").grid(row=2, column=0, sticky=NE, padx=4, pady=4)
+        self.txt_text = Text(content_frame, height=5, wrap="word")
+        self.txt_text.grid(row=2, column=1, columnspan=2, sticky=E + W, padx=4, pady=4)
 
-        ttk.Label(optf, text="Dither:").grid(row=0, column=0, sticky=E, padx=4, pady=4)
-        ttk.Combobox(optf, textvariable=self.dither, values=DITHER_CHOICES, state="readonly").grid(row=0, column=1, sticky=E+W, padx=4, pady=4)
+        ttk.Label(content_frame, text="Feed lines:").grid(row=3, column=0, sticky=E, padx=4, pady=4)
+        self.spn_feed = ttk.Spinbox(content_frame, from_=1, to=1000, increment=1, textvariable=self.feed_lines, width=8)
+        self.spn_feed.grid(row=3, column=1, sticky=W, padx=4, pady=4)
 
-        ttk.Label(optf, text="Threshold:").grid(row=0, column=2, sticky=E, padx=4, pady=4)
-        ttk.Entry(optf, textvariable=self.threshold, width=8).grid(row=0, column=3, sticky=W, padx=4, pady=4)
+        options_frame = ttk.LabelFrame(main, text="Options")
+        options_frame.grid(row=2, column=0, columnspan=2, sticky=E + W, pady=(0, 8))
+        for col in range(8):
+            options_frame.columnconfigure(col, weight=1)
 
-        ttk.Label(optf, text="Overstrike:").grid(row=0, column=4, sticky=E, padx=4, pady=4)
-        ttk.Spinbox(optf, from_=1, to=3, increment=1, textvariable=self.overstrike, width=6).grid(row=0, column=5, sticky=W, padx=4, pady=4)
+        ttk.Label(options_frame, text="Dither:").grid(row=0, column=0, sticky=E, padx=4, pady=4)
+        ttk.Combobox(options_frame, textvariable=self.dither, values=DITHER_CHOICES, state="readonly").grid(
+            row=0, column=1, sticky=E + W, padx=4, pady=4
+        )
 
-        ttk.Label(optf, text="Font:").grid(row=1, column=0, sticky=E, padx=4, pady=4)
-        ttk.Entry(optf, textvariable=self.font_name).grid(row=1, column=1, sticky=E+W, padx=4, pady=4)
+        ttk.Label(options_frame, text="Threshold:").grid(row=0, column=2, sticky=E, padx=4, pady=4)
+        ttk.Entry(options_frame, textvariable=self.threshold, width=8).grid(row=0, column=3, sticky=W, padx=4, pady=4)
 
-        ttk.Label(optf, text="Size:").grid(row=1, column=2, sticky=E, padx=4, pady=4)
-        ttk.Spinbox(optf, from_=6, to=96, increment=1, textvariable=self.font_size, width=6).grid(row=1, column=3, sticky=W, padx=4, pady=4)
+        ttk.Label(options_frame, text="Overstrike:").grid(row=0, column=4, sticky=E, padx=4, pady=4)
+        ttk.Spinbox(options_frame, from_=1, to=3, increment=1, textvariable=self.overstrike, width=6).grid(
+            row=0, column=5, sticky=W, padx=4, pady=4
+        )
 
-        ttk.Label(optf, text="Align:").grid(row=1, column=4, sticky=E, padx=4, pady=4)
-        ttk.Combobox(optf, textvariable=self.align, values=ALIGN_CHOICES, state="readonly").grid(row=1, column=5, sticky=E+W, padx=4, pady=4)
-
-        self.chk_up = ttk.Checkbutton(optf, text="Upside down", variable=self.upside_down)
+        self.chk_up = ttk.Checkbutton(options_frame, text="Upside down", variable=self.upside_down)
         self.chk_up.grid(row=0, column=6, sticky=W, padx=4, pady=4)
-        self.chk_dbg = ttk.Checkbutton(optf, text="Debug save", variable=self.debug_save)
-        self.chk_dbg.grid(row=0, column=7, sticky=W, padx=4, pady=4)
+        self.chk_debug = ttk.Checkbutton(options_frame, text="Debug save", variable=self.debug_save)
+        self.chk_debug.grid(row=0, column=7, sticky=W, padx=4, pady=4)
 
-        # Actions frame
-        actf = ttk.Frame(main)
-        actf.grid(row=3, column=0, columnspan=2, sticky=E+W)
-        actf.columnconfigure(0, weight=1)
-        actf.columnconfigure(1, weight=0)
-        actf.columnconfigure(2, weight=0)
-        self.btn_run = ttk.Button(actf, text="Print / Run", command=self._start_run)
+        ttk.Label(options_frame, text="Font:").grid(row=1, column=0, sticky=E, padx=4, pady=4)
+        if _AVAILABLE_FONTS:
+            ttk.Combobox(options_frame, textvariable=self.font_name, values=_AVAILABLE_FONTS, state="readonly").grid(
+                row=1, column=1, sticky=E + W, padx=4, pady=4
+            )
+        else:
+            ttk.Entry(options_frame, textvariable=self.font_name).grid(row=1, column=1, sticky=E + W, padx=4, pady=4)
+
+        ttk.Label(options_frame, text="Size:").grid(row=1, column=2, sticky=E, padx=4, pady=4)
+        ttk.Spinbox(options_frame, from_=6, to=96, increment=1, textvariable=self.font_size, width=6).grid(
+            row=1, column=3, sticky=W, padx=4, pady=4
+        )
+
+        ttk.Label(options_frame, text="Align:").grid(row=1, column=4, sticky=E, padx=4, pady=4)
+        ttk.Combobox(options_frame, textvariable=self.align, values=ALIGN_CHOICES, state="readonly").grid(
+            row=1, column=5, sticky=E + W, padx=4, pady=4
+        )
+
+        ttk.Label(options_frame, text="Brightness:").grid(row=2, column=0, sticky=E, padx=4, pady=4)
+        ttk.Spinbox(options_frame, from_=0, to=255, increment=1, textvariable=self.brightness, width=8).grid(
+            row=2, column=1, sticky=W, padx=4, pady=4
+        )
+
+        ttk.Label(options_frame, text="Intensity:").grid(row=2, column=2, sticky=E, padx=4, pady=4)
+        ttk.Spinbox(options_frame, from_=0, to=255, increment=1, textvariable=self.intensity, width=8).grid(
+            row=2, column=3, sticky=W, padx=4, pady=4
+        )
+
+        action_frame = ttk.Frame(main)
+        action_frame.grid(row=3, column=0, columnspan=2, sticky=E + W)
+        action_frame.columnconfigure(0, weight=1)
+
+        self.btn_run = ttk.Button(action_frame, text="Run", command=self._start_run)
         self.btn_run.grid(row=0, column=0, sticky=E, padx=4, pady=4)
-        self.btn_list_fonts = ttk.Button(actf, text="List Fonts", command=self._list_fonts)
-        self.btn_list_fonts.grid(row=0, column=1, sticky=E, padx=4, pady=4)
-        self.btn_cancel = ttk.Button(actf, text="Cancel", command=self._cancel_run, state="disabled")
+
+        self.btn_fonts = ttk.Button(action_frame, text="List Fonts", command=self._list_fonts)
+        self.btn_fonts.grid(row=0, column=1, sticky=E, padx=4, pady=4)
+
+        self.btn_cancel = ttk.Button(action_frame, text="Cancel", command=self._cancel_run, state="disabled")
         self.btn_cancel.grid(row=0, column=2, sticky=E, padx=4, pady=4)
 
-        # Log output
         self.log = ScrolledText(main, height=20, wrap="word")
-        self.log.grid(row=4, column=0, columnspan=2, sticky=N+S+E+W, pady=(8,0))
+        self.log.grid(row=4, column=0, columnspan=2, sticky=N + S + E + W, pady=(8, 0))
         main.rowconfigure(4, weight=1)
 
-        self._on_mode_change()
-        self.root.after(50, self._pump_output)
-
-    # ====== UI handlers ======
-    def _on_mode_change(self):
-        mode = self.mode.get()
-        # Enable/disable content controls based on mode
-        image_enabled = (mode == "image")
-        folder_enabled = (mode == "folder")
-        text_enabled = (mode == "text")
-        feed_enabled = (mode == "feed")
-
-        # Image
-        state = "normal" if image_enabled else "disabled"
-        self.ent_img.configure(state=state)
-        self.btn_img.configure(state=state)
-        # Folder
-        state = "normal" if folder_enabled else "disabled"
-        self.ent_dir.configure(state=state)
-        self.btn_dir.configure(state=state)
-        # Text
-        self.ent_text.configure(state=("normal" if text_enabled else "disabled"))
-        # Feed
-        self.spn_feed.configure(state=("normal" if feed_enabled else "disabled"))
-
     def _pick_image(self):
-        path = filedialog.askopenfilename(title="Select image",
-                                          filetypes=[("Images", ".png .jpg .jpeg .bmp .gif"), ("All", "*.*")])
+        path = filedialog.askopenfilename(
+            title="Select image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif"), ("All files", "*.*")]
+        )
         if path:
             self.image_path.set(path)
 
     def _pick_folder(self):
-        path = filedialog.askdirectory(title="Select folder with images")
+        path = filedialog.askdirectory(title="Select folder")
         if path:
             self.folder_path.set(path)
 
-    # ====== Subprocess orchestration ======
-    def _build_cmd(self, mode_override=None):
-        """Build the CLI command based on UI state."""
+    def _on_mode_change(self):
+        mode = self.mode.get()
+
+        image_enabled = mode == "image"
+        folder_enabled = mode == "folder"
+        text_enabled = mode == "text"
+        test_enabled = mode == "test"
+        feed_enabled = mode == "feed"
+
+        self.ent_img.configure(state="normal" if image_enabled else "disabled")
+        self.btn_img.configure(state="normal" if image_enabled else "disabled")
+        self.ent_dir.configure(state="normal" if folder_enabled else "disabled")
+        self.btn_dir.configure(state="normal" if folder_enabled else "disabled")
+        self.spn_feed.configure(state="normal" if feed_enabled else "disabled")
+        self.txt_text.configure(state="normal" if text_enabled else "disabled")
+
+    def _append_log(self, text):
+        self.log.insert(END, text)
+        self.log.see(END)
+
+    def _mask_cmd(self, cmd):
+        return cmd
+
+    def _require_cli(self):
         if not os.path.exists(CLI_SCRIPT_NAME):
-            messagebox.showerror("Missing script", f"Cannot find '{CLI_SCRIPT_NAME}' next to this file.")
+            messagebox.showerror("Missing CLI", f"Cannot find '{CLI_SCRIPT_NAME}' in the current folder.")
+            return False
+        return True
+
+    def _build_cmd(self, fonts_only=False):
+        if not self._require_cli():
             return None
 
         cmd = [sys.executable, "-u", CLI_SCRIPT_NAME]
-        # device
-        if self.device_name.get().strip():
-            cmd += ["-N", self.device_name.get().strip()]
-        elif self.device_addr.get().strip():
-            cmd += ["-d", self.device_addr.get().strip()]
-        else:
-            # allow --list-fonts without device, but otherwise require
-            if (mode_override or self.mode.get()) != "fonts":
-                messagebox.showwarning("Device required", "Please enter a Device Name or MAC address.")
-                return None
 
-        # options
-        if self.debug_save.get():
-            cmd += ["-s"]
-        if self.upside_down.get():
-            cmd += ["-u"]
+        if fonts_only:
+            cmd.append("-l")
+            return cmd
+
+        device_name = self.device_name.get().strip()
+        device_addr = self.device_addr.get().strip()
+        if device_name:
+            cmd += ["-N", device_name]
+        elif device_addr:
+            cmd += ["-d", device_addr]
+        else:
+            messagebox.showwarning("Device required", "Please enter a BLE device name or MAC address.")
+            return None
+
         cmd += ["--dither", self.dither.get()]
         cmd += ["--overstrike", str(self.overstrike.get())]
         cmd += ["--threshold", self.threshold.get()]
-
-        # font options (used only when -t)
         cmd += ["-n", self.font_name.get().strip() or "Arial"]
         cmd += ["-z", str(self.font_size.get())]
         cmd += ["-a", self.align.get()]
+        cmd += ["--brightness", str(self.brightness.get())]
+        cmd += ["--intensity", str(self.intensity.get())]
 
-        mode = mode_override or self.mode.get()
+        if self.upside_down.get():
+            cmd.append("-u")
+        if self.debug_save.get():
+            cmd.append("-s")
+
+        mode = self.mode.get()
         if mode == "image":
-            if not self.image_path.get().strip():
-                messagebox.showwarning("Select image", "Please choose an image file.")
+            image = self.image_path.get().strip()
+            if not image:
+                messagebox.showwarning("Missing image", "Please select an image file.")
                 return None
-            cmd += ["-i", self.image_path.get().strip()]
+            cmd += ["-i", image]
         elif mode == "folder":
-            if not self.folder_path.get().strip():
-                messagebox.showwarning("Select folder", "Please choose a folder.")
+            folder = self.folder_path.get().strip()
+            if not folder:
+                messagebox.showwarning("Missing folder", "Please select a folder.")
                 return None
-            cmd += ["-f", self.folder_path.get().strip()]
+            cmd += ["-f", folder]
         elif mode == "text":
-            txt = self.text_to_print.get()
-            if not txt:
-                messagebox.showwarning("Enter text", "Please enter the text to print.")
+            text_value = self.txt_text.get("1.0", "end-1c")
+            if not text_value:
+                messagebox.showwarning("Missing text", "Please enter text to print.")
                 return None
-            cmd += ["-t", txt]
+            cmd += ["-t", text_value]
         elif mode == "test":
-            cmd += ["-x"]
+            if not os.path.isdir(TEST_IMAGE_FOLDER):
+                messagebox.showwarning("Missing test folder", f"Could not find '{TEST_IMAGE_FOLDER}' next to the GUI.")
+                return None
+            cmd += ["-f", TEST_IMAGE_FOLDER]
         elif mode == "feed":
             cmd += ["-p", str(self.feed_lines.get())]
-        elif mode == "fonts":
-            cmd = [sys.executable, CLI_SCRIPT_NAME, "-l"]
         else:
             messagebox.showerror("Invalid mode", f"Unknown mode: {mode}")
             return None
+
         return cmd
-
-    def _start_run(self):
-        cmd = self._build_cmd()
-        if not cmd:
-            return
-        if self.proc is not None:
-            messagebox.showinfo("Busy", "A job is already running. Please cancel or wait.")
-            return
-        self._append_log(f"\n> {' '.join(self._mask_cmd(cmd))}\n")
-        self.is_running = True
-        self.btn_run.configure(state="disabled")
-        self.btn_cancel.configure(state="normal")
-        t = threading.Thread(target=self._run_proc, args=(cmd,), daemon=True)
-        t.start()
-
-    def _ask_preview_choice_blocking(self, desc: str) -> str:
-        done = threading.Event()
-        result = {"ans": "y"}
-
-        def show_dialog():
-            win = Toplevel(self.root)
-            win.title("Confirm print"); win.transient(self.root); win.grab_set()
-            ttk.Label(win, text=f"Print this job?\n{desc}").grid(row=0, column=0, columnspan=4, padx=12, pady=(12,8))
-            def choose(ch):
-                result["ans"] = ch
-                try: win.grab_release()
-                except Exception: pass
-                win.destroy(); done.set()
-            ttk.Button(win, text="Yes", command=lambda: choose('y')).grid(row=1, column=0, padx=6, pady=10)
-            ttk.Button(win, text="Skip", command=lambda: choose('s')).grid(row=1, column=1, padx=6, pady=10)
-            ttk.Button(win, text="All remaining", command=lambda: choose('a')).grid(row=1, column=2, padx=6, pady=10)
-            ttk.Button(win, text="Quit", command=lambda: choose('q')).grid(row=1, column=3, padx=6, pady=10)
-            for c in range(4): win.columnconfigure(c, weight=1)
-            win.protocol("WM_DELETE_WINDOW", lambda: choose('s'))
-            win.geometry("420x130")
-        self.root.after(0, show_dialog)
-        done.wait()
-        return result["ans"]
 
     def _run_proc(self, cmd):
         try:
@@ -314,117 +313,100 @@ class MX01WGUI:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                stdin=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
                 text=True,
-                bufsize=0  # fully unbuffered so read(1) returns promptly
+                bufsize=1,
+                universal_newlines=True,
             )
 
-            prompt_re = re.compile(
-                r"\[(\d+)/(\d+)\]\s+Print '(.+?)'\?\s+\[Y\]es\s*/\s*\[s\]kip\s*/\s*\[a\]ll remaining\s*/\s*\[q\]uit:",
-                re.DOTALL
-            )
+            assert self.proc.stdout is not None
+            for line in self.proc.stdout:
+                self.output_q.put(line)
 
-            buf = ""
-            while True:
-                ch = self.proc.stdout.read(1)
-                if not ch:  # EOF
-                    break
-
-                buf += ch
-                # forward to UI immediately (character streaming = snappy log)
-                self.output_q.put(ch)
-
-                # Only keep a reasonable tail to search (performance & memory)
-                if len(buf) > 4000:
-                    buf = buf[-2000:]
-
-                m = prompt_re.search(buf)
-                if m and self.proc and self.proc.stdin:
-                    desc = m.group(3)
-                    ans = self._ask_preview_choice_blocking(desc)  # 'y'/'s'/'a'/'q'
-                    try:
-                        self.proc.stdin.write(ans + "\n")
-                        self.proc.stdin.flush()
-                    except Exception as e:
-                        self.output_q.put(f"\n[Error sending response to CLI] {e}\n")
-                    # drop everything up to the end of the matched prompt
-                    buf = buf[m.end():]
-
-            self.proc.wait()
-            rc = self.proc.returncode
-            self.output_q.put(f"\n[Process exited with code {rc}]\n")
-
-        except Exception as e:
-            self.output_q.put(f"\n[Error] {e}\n")
+            returncode = self.proc.wait()
+            self.output_q.put(f"\n[process exited with code {returncode}]\n")
+        except Exception as exc:
+            self.output_q.put(f"\n[failed to start process: {exc}]\n")
         finally:
             self.proc = None
             self.is_running = False
+            self.output_q.put("__PROCESS_DONE__")
+
+    def _start_run(self):
+        if self.proc is not None:
+            messagebox.showinfo("Busy", "A job is already running.")
+            return
+
+        cmd = self._build_cmd()
+        if not cmd:
+            return
+
+        self._append_log("\n> " + " ".join(self._mask_cmd(cmd)) + "\n")
+        self.is_running = True
+        self.btn_run.configure(state="disabled")
+        self.btn_cancel.configure(state="normal")
+
+        thread = threading.Thread(target=self._run_proc, args=(cmd,), daemon=True)
+        thread.start()
+
+    def _list_fonts(self):
+        if self.proc is not None:
+            messagebox.showinfo("Busy", "A job is already running.")
+            return
+
+        cmd = self._build_cmd(fonts_only=True)
+        if not cmd:
+            return
+
+        self._append_log("\n> " + " ".join(self._mask_cmd(cmd)) + "\n")
+        self.is_running = True
+        self.btn_run.configure(state="disabled")
+        self.btn_cancel.configure(state="normal")
+
+        thread = threading.Thread(target=self._run_proc, args=(cmd,), daemon=True)
+        thread.start()
 
     def _cancel_run(self):
+        if self.proc is None:
+            return
+        try:
+            self.proc.terminate()
+            self._append_log("\n[termination requested]\n")
+        except Exception as exc:
+            self._append_log(f"\n[failed to terminate process: {exc}]\n")
+
+    def _pump_output(self):
+        try:
+            while True:
+                item = self.output_q.get_nowait()
+                if item == "__PROCESS_DONE__":
+                    self.btn_run.configure(state="normal")
+                    self.btn_cancel.configure(state="disabled")
+                    continue
+                self._append_log(item)
+        except queue.Empty:
+            pass
+        self.after_id = self.root.after(50, self._pump_output)
+
+    def _on_close(self):
         if self.proc is not None:
             try:
                 self.proc.terminate()
             except Exception:
                 pass
-        self.btn_cancel.configure(state="disabled")
-        self.btn_run.configure(state="normal")
-
-    def _list_fonts(self):
-        cmd = self._build_cmd(mode_override="fonts")
-        if not cmd:
-            return
-        self._append_log(f"\n> {' '.join(cmd)}\n")
-        threading.Thread(target=self._run_proc, args=(cmd,), daemon=True).start()
-
-    def _pump_output(self):
-        while True:
+        if self.after_id is not None:
             try:
-                line = self.output_q.get_nowait()
-            except queue.Empty:
-                break
-            self._append_log(line)
-        # buttons state if proc ended
-        if not self.is_running:
-            self.btn_cancel.configure(state="disabled")
-            self.btn_run.configure(state="normal")
-        self.root.after(50, self._pump_output)
+                self.root.after_cancel(self.after_id)
+            except Exception:
+                pass
+        self.root.destroy()
 
-    def _append_log(self, text):
-        self.log.insert(END, text)
-        self.log.see(END)
 
-    def _mask_cmd(self, cmd_list):
-        """Mask potentially long text args for display (e.g., -t).
-        Keep it readable in the log."""
-        masked = []
-        it = iter(enumerate(cmd_list))
-        for i, tok in it:
-            if tok in ("-t", "--text"):
-                masked.append(tok)
-                try:
-                    _i, val = next(it)
-                    if len(val) > 60:
-                        val = val[:57] + "…"
-                    masked.append(val)
-                except StopIteration:
-                    pass
-            else:
-                masked.append(tok)
-        return masked
+def main():
+    root = Tk()
+    MXW01GUI(root)
+    root.mainloop()
+
 
 if __name__ == "__main__":
-    root = Tk()
-    # a bit of modern-ish styling
-    try:
-        from ctypes import windll
-        windll.shcore.SetProcessDpiAwareness(1)  # crisp on Windows, ignore elsewhere
-    except Exception:
-        pass
-    style = ttk.Style()
-    try:
-        style.theme_use("clam")
-    except Exception:
-        pass
-    app = MX01WGUI(root)
-    root.geometry("980x640")
-    root.mainloop()
+    main()
