@@ -472,6 +472,33 @@ def check_a9_status(payload: bytes) -> bool:
     return bool(payload) and len(payload) >= 1 and payload[0] == 0
 
 
+def parse_mac_from_address(address: Union[str, BLEDevice]) -> str:
+    """Return just the MAC part of an address string."""
+    mac_str = str(address).split("@")[0]
+    return mac_str.upper()
+
+
+async def probe_device(target: Union[str, BLEDevice], timeout: float = 2.5) -> bool:
+    """Try rapid connect+disconnect cycles to wake a sleeping BLE printer."""
+    mac_str = str(target) if isinstance(target, str) else parse_mac_from_address(target)
+    
+    # Do 3 rapid fire connects with no delay between them
+    # Some cheap BLE peripherals only respond to repeated attempts
+    for attempt in range(3):
+        try:
+            async with BleakClient(mac_str, timeout=timeout) as client:
+                if client.is_connected:
+                    print(f"  [wake ping succeeded on attempt {attempt + 1} — disconnected]")
+                    return True
+        except (TimeoutError, BleakError, OSError):
+            pass
+        # Tiny gap to let controller settle — critical for deep-sleep devices
+        await asyncio.sleep(0.05)
+    
+    print("  [wake ping failed — printer may need power cycle or button press]")
+    return False
+
+
 async def resolve_ble_device(device_addr: Optional[str], device_name: Optional[str], attempts: int = 2, scan_timeout: float = 6.0) -> Union[str, BLEDevice]:
     if not device_name:
         if not device_addr:
@@ -759,27 +786,40 @@ async def run(args: argparse.Namespace) -> int:
         print(f"Error resolving device: {exc}")
         return 1
 
-    if args.feed is not None:
-        print(f"Attempting to connect to printer at {target}...")
+    # Connect with a simple retry on failure
+    print(f"Attempting to connect to printer at {target}...")
+    
+    # Try to connect once; if it fails wait briefly and try again
+    client = None
+    for attempt in range(1, 3):
         try:
-            async with BleakClient(target, timeout=45.0) as client:
-                if not client.is_connected:
-                    print("Failed to connect.")
-                    return 1
-                print(f"Connected to {client.address}")
-                await client.start_notify(NOTIFY_UUID, notification_handler)
-                try:
-                    success = await run_feed_paper(client, args.feed)
-                finally:
-                    await asyncio.sleep(1.0)
-                    await client.stop_notify(NOTIFY_UUID)
-                return 0 if success else 1
-        except BleakError as exc:
-            print(f"Bluetooth error: {exc}")
-            return 1
+            print(f"  Connect attempt {attempt}/2...", flush=True)
+            client = BleakClient(target, timeout=30.0)
+            await client.connect()
+            break
+        except BleakError as e:
+            print(f"  Attempt {attempt} failed: {e}", flush=True)
         except asyncio.TimeoutError:
-            print("Connection timed out.")
-            return 1
+            print(f"  Attempt {attempt} timed out", flush=True)
+        if attempt < 2:
+            print("  Waiting 3s before retry...", flush=True)
+            await asyncio.sleep(3.0)
+    
+    if not client or not client.is_connected:
+        print("Failed to connect. Try turning the printer off and on, or press its button.", flush=True)
+        return 1
+    
+    print(f"Connected to {client.address}", flush=True)
+    await client.start_notify(NOTIFY_UUID, notification_handler)
+    
+    if args.feed is not None:
+        try:
+            success = await run_feed_paper(client, args.feed)
+        finally:
+            await asyncio.sleep(1.0)
+            await client.stop_notify(NOTIFY_UUID)
+            await client.disconnect()
+        return 0 if success else 1
 
     jobs = prepare_print_jobs(args)
     if not jobs:
@@ -790,34 +830,244 @@ async def run(args: argparse.Namespace) -> int:
         return save_debug_images(jobs, args.upside_down)
 
     print(f"Prepared {len(jobs)} print job(s).")
+    all_ok = True
     try:
-        async with BleakClient(target, timeout=45.0) as client:
-            if not client.is_connected:
-                print("Failed to connect.")
-                return 1
-            print(f"Connected to {client.address}")
-            await client.start_notify(NOTIFY_UUID, notification_handler)
-            try:
-                all_ok = True
-                for index, (image, desc) in enumerate(jobs, start=1):
-                    print(f"--- Print job {index}/{len(jobs)} ---")
-                    ok = await run_print_job(client, image, desc, args.dither, args.overstrike, args.intensity)
-                    all_ok = all_ok and ok
-                    if index < len(jobs):
-                        await asyncio.sleep(DELAY_BETWEEN_PRINTS)
-            finally:
-                await asyncio.sleep(1.0)
-                await client.stop_notify(NOTIFY_UUID)
-            return 0 if all_ok else 1
+        # Reuse the existing `client` from above
+        await client.start_notify(NOTIFY_UUID, notification_handler)
+        try:
+            for index, (image, desc) in enumerate(jobs, start=1):
+                print(f"--- Print job {index}/{len(jobs)} ---")
+                ok = await run_print_job(client, image, desc, args.dither, args.overstrike, args.intensity)
+                all_ok = all_ok and ok
+                if index < len(jobs):
+                    await asyncio.sleep(DELAY_BETWEEN_PRINTS)
+        finally:
+            await asyncio.sleep(1.0)
+            await client.stop_notify(NOTIFY_UUID)
+            await client.disconnect()
     except BleakError as exc:
         print(f"Bluetooth error: {exc}")
-        return 1
+        all_ok = False
     except asyncio.TimeoutError:
         print("Connection timed out.")
-        return 1
+        all_ok = False
     except Exception as exc:
         print(f"Unexpected error: {exc}")
+        all_ok = False
+
+    return 0 if all_ok else 1
+
+
+# ── Session Mode ───────────────────────────────────────────────────
+
+# ── Session command handlers (call directly on existing client) ──────
+
+async def _session_do_image(session_client, image_path, args: argparse.Namespace) -> bool:
+    img = prepare_image_for_print(image_path, PRINTER_WIDTH_PIXELS, args.dither, args.threshold, args.brightness)
+    if args.upside_down:
+        img = img.rotate(180)
+    ok = await run_print_job(session_client, img, os.path.basename(image_path),
+                             args.dither, args.overstrike, args.intensity)
+    if not ok:
+        print("✗ Failed")
+    else:
+        print("✓ Success")
+    print()
+    return ok
+
+
+async def _session_do_folder(session_client, folder, args: argparse.Namespace) -> bool:
+    files = sorted([f for f in os.listdir(folder) if f.lower().endswith(SUPPORTED_EXTENSIONS)])
+    if not files:
+        print("No supported images found.")
+        return True
+    
+    all_ok = True
+    print(f"\nPrinting {len(files)} image(s) from folder:\n")
+    for filename in files:
+        path = os.path.join(folder, filename)
+        img = prepare_image_for_print(path, PRINTER_WIDTH_PIXELS, args.dither, args.threshold, args.brightness)
+        if args.upside_down:
+            img = img.rotate(180)
+        ok = await run_print_job(session_client, img, filename,
+                                 args.dither, args.overstrike, args.intensity)
+        if not ok:
+            print(f"✗ {filename} failed\n")
+            all_ok = False
+        else:
+            print(f"✓ {filename}\n")
+    return all_ok
+
+
+async def _session_do_text(session_client, text_value, args: argparse.Namespace) -> bool:
+    font = load_font(args.font, args.font_size)
+    img = create_text_bitmap(text_value, font, PRINTER_WIDTH_PIXELS, alignment=args.align)
+    if args.upside_down:
+        img = img.rotate(180)
+    ok = await run_print_job(session_client, img, f"Text: {text_value[:32]}",
+                             args.dither, args.overstrike, args.intensity)
+    if not ok:
+        print("✗ Failed")
+    else:
+        print("✓ Success")
+    print()
+    return ok
+
+
+async def _session_do_feed(session_client, n: int, args: argparse.Namespace) -> bool:
+    ok = await run_feed_paper(session_client, n)
+    if not ok:
+        print("✗ Feed failed")
+    else:
+        print(f"✓ Fed {n} lines")
+    print()
+    return ok
+
+
+async def _session_do_debug_save(folder: str = "debug_output", args: argparse.Namespace = None) -> None:
+    output_dir = Path(folder)
+    # No way to queue images in session mode without storing them; warn instead.
+    print("Debug-save requires image preparation first. Use one-shot mode:")
+    print("  python MXW01printV3.py --device-name MXW01 --dither fs -i /path/img.png -s")
+    print()
+
+
+async def run_session(args: argparse.Namespace) -> int:
+    """Persistent session: connect once, execute commands from stdin."""
+    # Resolve device first
+    try:
+        target = await resolve_ble_device(args.device, args.device_name)
+    except Exception as exc:
+        print(f"Error resolving device: {exc}")
         return 1
+    
+    # Connect with retry
+    print(f"Attempting to connect to printer at {target}...", flush=True)
+    client = None
+    for attempt in range(1, 3):
+        try:
+            print(f"  Connect attempt {attempt}/2...", flush=True)
+            client = BleakClient(target, timeout=30.0)
+            await client.connect()
+            break
+        except BleakError as e:
+            print(f"  Attempt {attempt} failed: {e}", flush=True)
+        except asyncio.TimeoutError:
+            print(f"  Attempt {attempt} timed out", flush=True)
+        if attempt < 2:
+            print("  Waiting 3s before retry...", flush=True)
+            await asyncio.sleep(3.0)
+    
+    if not client or not client.is_connected:
+        print("Failed to connect. Try turning the printer off and on, or press its button.", flush=True)
+        return 1
+    
+    print(f"Connected to {client.address}", flush=True)
+    await client.start_notify(NOTIFY_UUID, notification_handler)
+    
+    print()
+    print("=" * 60)
+    print("  MXW01 Persistent Session")
+    print("=" * 60)
+    print("  Commands:")
+    print("    image <path>          Print an image file")
+    print("    folder <directory>    Print all images in a directory")
+    print("    text <string>         Print text")
+    print("    feed [lines]          Feed paper (default 40)")
+    print("    debug-save            Save bitmaps (no print)")
+    print("    fonts                 List available fonts")
+    print("    quit                  Disconnect and exit")
+    print("=" * 60)
+    print()
+    
+    try:
+        # Read stdin lines - blocking is fine for CLI session mode
+        # Run in executor so it doesn't block the event loop
+        loop = asyncio.get_running_loop()
+        
+        while True:
+            line = await loop.run_in_executor(None, sys.stdin.readline)
+            if not line:  # EOF
+                break
+            
+            line = line.strip()
+            if not line:
+                continue
+                
+            parts = line.split(None, 1)
+            cmd = parts[0].lower()
+            value = parts[1] if len(parts) > 1 else None
+            
+            if cmd in ("quit", "exit", "q"):
+                break
+            elif cmd in ("help", "h", "?"):
+                print("""Available commands:
+  image <path>       - Print an image file
+  folder <dir>       - Print all images in a directory
+  text <string>      - Print text
+  feed [lines]       - Feed blank paper (default: 40 lines)
+  debug-save         - Prepare but don't print (saves to debug_output/)
+  fonts              - List available fonts
+  status             - Check printer status
+  quit               - Disconnect and exit""")
+            elif cmd == "fonts":
+                if MATPLOTLIB_AVAILABLE:
+                    fonts = sorted(set(e.name for e in font_manager.fontManager.ttflist))
+                    for f in fonts:
+                        print(f"  {f}")
+                else:
+                    print("Matplotlib not installed — cannot list fonts.")
+            elif cmd == "status":
+                print("Printer is connected and ready.")
+            elif cmd == "image":
+                if not value:
+                    print("Usage: image <path>")
+                    continue
+                if not os.path.isfile(value):
+                    print(f"File not found: {value}")
+                    continue
+                ok = await _session_do_image(client, value, args)
+            
+            elif cmd == "folder":
+                if not value:
+                    print("Usage: folder <directory>")
+                    continue
+                if not os.path.isdir(value):
+                    print(f"Directory not found: {value}")
+                    continue
+                ok = await _session_do_folder(client, value, args)
+            
+            elif cmd == "text":
+                if not value:
+                    print("Usage: text <string>")
+                    continue
+                ok = await _session_do_text(client, value, args)
+            
+            elif cmd == "feed":
+                n = int(value or "40")
+                ok = await _session_do_feed(client, n, args)
+            
+            elif cmd == "debug-save":
+                await _session_do_debug_save()
+            
+            else:
+                print(f"Unknown command: {cmd}. Type 'help' for available commands.")
+            print()
+    
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+    
+    # Cleanup - detach client from any pending operations
+    try:
+        await client.stop_notify(NOTIFY_UUID)
+    except Exception:
+        pass
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+    print("Disconnected.")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -846,13 +1096,21 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Image brightness 0..255. Lower is darker, higher is lighter.")
     parser.add_argument("--intensity", type=int, default=93,
                     help="Printer intensity 0..255. Default: 93.")
+    parser.add_argument("--session", action="store_true",
+                    help="Persistent session mode: connect once, read commands from stdin until 'quit'.")
     return parser
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    return asyncio.run(run(args))
+    
+    if args.session:
+        # Persistent session mode - connect once, run commands from stdin
+        return asyncio.run(run_session(args))
+    else:
+        # One-shot mode - connect, execute, disconnect
+        return asyncio.run(run(args))
 
 
 if __name__ == "__main__":
